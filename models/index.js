@@ -30,6 +30,9 @@ const activeModelFiles = [
   'favorite.js',
   'appNotification.js',
   'auditLog.js',
+  'chefKyc.js',
+  'quote.js',
+  'pricingSetting.js',
 ];
 
 let sequelize;

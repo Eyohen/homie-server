@@ -20,7 +20,8 @@
     "users:seed": "node scripts/seedSpilightUsers.js",
     "businesses:seed": "node scripts/seedBusinessAccounts.js",
     "billing:ensure": "node scripts/ensureBilling.js",
-    "homie:seed": "node scripts/seedHomieAccounts.js"
+    "homie:seed": "node scripts/seedHomieAccounts.js",
+    "homie:reseed": "node scripts/seedHomieAccounts.js --fresh"
   },
   "keywords": [
     "connections",

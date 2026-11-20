@@ -8,6 +8,31 @@ cloudinary.config({
 });
 
 module.exports = {
+  // Private (authenticated) upload for KYC documents. Returns a reference "<public_id>.<format>"
+  // that is stored in the database instead of a URL. Files are only readable through signedUrl().
+  uploadPrivate: async (file, folder) => {
+    try {
+      const result = await cloudinary.uploader.upload(file, {
+        resource_type: 'image', type: 'authenticated', folder, use_filename: false, unique_filename: true,
+      });
+      return { ref: `${result.public_id}.${result.format}`, bytes: result.bytes };
+    } catch (error) {
+      console.error('Cloudinary private upload error:', error);
+      throw new Error('Failed to upload document');
+    }
+  },
+
+  // Short-lived download link for a private document (default 10 minutes). Admin use only.
+  signedUrl: (ref, ttlSeconds = 600) => {
+    if (!ref) return null;
+    const dot = ref.lastIndexOf('.');
+    const publicId = dot > 0 ? ref.slice(0, dot) : ref;
+    const format = dot > 0 ? ref.slice(dot + 1) : 'jpg';
+    return cloudinary.utils.private_download_url(publicId, format, {
+      resource_type: 'image', type: 'authenticated', expires_at: Math.floor(Date.now() / 1000) + ttlSeconds,
+    });
+  },
+
   // Upload image
   uploadImage: async (file, options = {}) => {
     try {

@@ -13,6 +13,8 @@ module.exports = {
   UNPAID_EXPIRY_MINUTES: num(process.env.HOMIE_UNPAID_EXPIRY_MINUTES, 120),
   // Paid bookings a chef has not accepted within this many hours are cancelled and refunded.
   CHEF_RESPONSE_HOURS: num(process.env.HOMIE_CHEF_RESPONSE_HOURS, 24),
+  // "Match me" bookings nobody could be allocated to within this many hours are cancelled and refunded.
+  ALLOCATION_DEADLINE_HOURS: num(process.env.HOMIE_ALLOCATION_DEADLINE_HOURS, 24),
   // Earliest a booking may be scheduled, in hours from now.
   MIN_LEAD_HOURS: num(process.env.HOMIE_MIN_LEAD_HOURS, 12),
   // Payouts or refunds above this naira amount need a second staff approval (enforced in admin API).

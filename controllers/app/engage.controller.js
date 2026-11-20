@@ -56,8 +56,13 @@ exports.markRead = async (req, res) => {
 exports.uploadImage = async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    const kind = ['avatar', 'portfolio', 'verification'].includes(req.query.kind) ? req.query.kind : 'portfolio';
     const dataUri = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    if (req.query.kind === 'kyc') {
+      // KYC documents are private: stored as authenticated assets; only a reference is returned.
+      const { ref } = await cloudinaryService.uploadPrivate(dataUri, `homie/kyc/${req.member.id}`);
+      return res.json({ success: true, data: { ref } });
+    }
+    const kind = ['avatar', 'portfolio'].includes(req.query.kind) ? req.query.kind : 'portfolio';
     const result = kind === 'avatar'
       ? await cloudinaryService.uploadAvatar(dataUri)
       : await cloudinaryService.uploadImage(dataUri, { folder: `homie/${kind}` });

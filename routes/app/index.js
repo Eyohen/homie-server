@@ -13,6 +13,9 @@ const bookings = require('../../controllers/app/booking.controller');
 const payments = require('../../controllers/app/payment.controller');
 const chat = require('../../controllers/app/chat.controller');
 const engage = require('../../controllers/app/engage.controller');
+const quotes = require('../../controllers/app/quote.controller');
+const kycCtrl = require('../../controllers/app/kyc.controller');
+const pricing = require('../../services/pricing.service');
 
 const router = express.Router();
 
@@ -27,7 +30,10 @@ const otpLimiter = rateLimit({
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 8 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => (/^image\/(jpe?g|png|webp|heic)$/i.test(file.mimetype) ? cb(null, true) : cb(new Error('Only image uploads are allowed'))),
+  fileFilter: (req, file, cb) => {
+    const ok = /^image\/(jpe?g|png|webp|heic)$/i.test(file.mimetype) || (req.query.kind === 'kyc' && file.mimetype === 'application/pdf');
+    return ok ? cb(null, true) : cb(new Error('Only image uploads (and PDFs for documents) are allowed'));
+  },
 });
 
 // ---- Paystack webhook (signature-verified, no member auth)
@@ -38,6 +44,11 @@ router.post('/auth/otp/request', otpLimiter, auth.requestOtp);
 router.post('/auth/otp/verify', otpLimiter, auth.verifyOtp);
 router.post('/auth/refresh', auth.refresh);
 router.post('/auth/logout', verifyMember, auth.logout);
+
+// ---- Public pricing rules (tier rates, minimum hours, fees)
+router.get('/config', async (req, res) => {
+  try { return res.json({ success: true, data: pricing.publicConfig(await pricing.getSettings()) }); } catch (e) { return res.status(500).json({ success: false, message: 'Could not load settings' }); }
+});
 
 // ---- Public discovery (signed-in members get favorites + default location)
 router.get('/chefs', optionalMember, chefs.list);
@@ -60,10 +71,8 @@ router.get('/banks', me.listBanks);
 // ---- Chef self-management
 router.get('/me/chef', me.getChefProfile);
 router.put('/me/chef', me.upsertChefProfile);
-router.put('/me/chef/services', requireChef, me.setServices);
 router.put('/me/chef/availability', requireChef, me.setAvailability);
 router.put('/me/chef/payout-account', requireChef, me.setPayoutAccount);
-router.post('/me/chef/verification', requireChef, me.submitVerification);
 router.get('/me/chef/earnings', requireChef, me.getEarnings);
 
 // ---- Favorites
@@ -75,16 +84,19 @@ router.delete('/favorites/:chefId', uuid('chefId'), validate, engage.removeFavor
 router.post(
   '/bookings',
   [
-    body('chefId').isUUID().withMessage('chefId is required'),
-    body('serviceId').isUUID().withMessage('serviceId is required'),
+    body('chefId').optional({ nullable: true }).isUUID().withMessage('chefId must be valid'),
+    body('tier').optional().isIn(['standard', 'premium', 'elite']),
+    body('hours').isInt({ min: 1, max: 12 }).withMessage('Choose how many hours'),
     body('scheduledAt').isISO8601().withMessage('scheduledAt must be a valid date'),
     body('address').trim().isLength({ min: 6, max: 500 }).withMessage('A full address is required'),
     body('guests').optional().isInt({ min: 1, max: 500 }),
-    body('groceries').optional().isFloat({ min: 0 }),
+    body('recurrence').optional().isIn(['once', 'weekly', 'monthly']),
+    body('sessions').optional().isInt({ min: 1, max: 52 }),
   ],
   validate,
   bookings.create
 );
+router.post('/bookings/price', bookings.price);
 router.get('/bookings', bookings.list);
 router.get('/payments/verify/:reference', bookings.verifyPayment);
 router.get('/bookings/:id', uuid(), validate, bookings.get);
@@ -97,6 +109,24 @@ router.post('/bookings/:id/accept', uuid(), validate, requireChef, bookings.acce
 router.post('/bookings/:id/decline', uuid(), validate, requireChef, bookings.decline);
 router.post('/bookings/:id/check-in', uuid(), validate, requireChef, bookings.checkIn);
 router.post('/bookings/:id/complete', uuid(), validate, requireChef, bookings.complete);
+
+// ---- Chef + Ingredients quotations
+router.post('/quotes', quotes.create);
+router.get('/quotes', quotes.list);
+router.get('/quotes/:id', uuid(), validate, quotes.get);
+router.post('/quotes/:id/approve', uuid(), validate, quotes.approve);
+router.post('/quotes/:id/decline', uuid(), validate, quotes.decline);
+
+// ---- KYC
+router.get('/kyc', kycCtrl.getCustomerKyc);
+router.put('/kyc/profile', kycCtrl.saveCustomerProfile);
+router.post('/kyc/id', kycCtrl.submitCustomerId);
+router.get('/chef-kyc', kycCtrl.getChefKyc);
+router.put('/chef-kyc/profile', kycCtrl.saveChefProfile);
+router.put('/chef-kyc/documents', kycCtrl.saveChefDocuments);
+router.put('/chef-kyc/references', kycCtrl.saveChefReferences);
+router.post('/chef-kyc/agreement', kycCtrl.acceptAgreement);
+router.post('/chef-kyc/submit', kycCtrl.submitChefKyc);
 
 // ---- Chat
 router.get('/chat/threads', chat.listThreads);

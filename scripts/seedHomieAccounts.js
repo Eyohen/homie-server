@@ -1,8 +1,13 @@
 require('dotenv').config();
 const db = require('../models');
-const { computePricing } = require('../services/booking.service');
+const pricingSvc = require('../services/pricing.service');
 
-const { Member, ChefProfile, ChefService, Booking, BookingPayment, BookingReview } = db;
+const { Member, ChefProfile, ChefKyc, Booking, BookingPayment, BookingReview } = db;
+
+// Tier per chef (Homie sets prices by tier): 3 elite, 8 premium, the rest standard.
+const ELITE = ['Kenji Tanaka', 'Marco Bianchi', 'Oluwaseun Adeleke'];
+const PREMIUM = ['Adaeze Okafor', 'Ifeanyi Nwosu', 'Giulia Rossi', 'Wei Zhang', 'Priya Sharma', 'Musa Abubakar', 'Femi Ogunleye', 'Bolanle Adebayo'];
+const tierOf = (name) => (ELITE.includes(name) ? 'elite' : PREMIUM.includes(name) ? 'premium' : 'standard');
 
 // Demo accounts for development: 24 verified chefs (3 per cuisine) with photos, menus and reviews,
 // plus 3 hirers. Safe to run repeatedly. Sign in with the phone numbers below; in development the
@@ -82,9 +87,9 @@ const CHEFS = [
 ];
 
 const HIRERS = [
-  { phone: '+2348100000001', firstName: 'Tobi', lastName: 'Adeyemi', email: 'tobi.adeyemi@example.com', address: '14 Admiralty Way, Lekki Phase 1, Lagos', lat: 6.4474, lng: 3.4723 },
-  { phone: '+2348100000002', firstName: 'Ngozi', lastName: 'Eze', email: 'ngozi.eze@example.com', address: '22 Awolowo Road, Ikoyi, Lagos', lat: 6.4549, lng: 3.4346 },
-  { phone: '+2348100000003', firstName: 'Kemi', lastName: 'Bello', email: 'kemi.bello@example.com', address: '5 Allen Avenue, Ikeja, Lagos', lat: 6.6018, lng: 3.3515 },
+  { phone: '+2348100000001', firstName: 'Tobi', lastName: 'Adeyemi', email: 'tobi@demo.homie.app', address: '14 Admiralty Way, Lekki Phase 1, Lagos', lat: 6.4474, lng: 3.4723 },
+  { phone: '+2348100000002', firstName: 'Ngozi', lastName: 'Eze', email: 'ngozi@demo.homie.app', address: '22 Awolowo Road, Ikoyi, Lagos', lat: 6.4549, lng: 3.4346 },
+  { phone: '+2348100000003', firstName: 'Kemi', lastName: 'Bello', email: 'kemi@demo.homie.app', address: '5 Allen Avenue, Ikeja, Lagos', lat: 6.6018, lng: 3.3515 },
 ];
 
 const jitter = (n, i) => Math.round((n + ((i % 7) - 3) * 0.002) * 1e6) / 1e6;
@@ -93,13 +98,27 @@ const phoneFor = (i) => `+23480000000${String(i + 1).padStart(2, '0')}`;
 (async () => {
   try {
     await db.sequelize.authenticate();
+    const settings = await pricingSvc.getSettings({ fresh: true });
+
+    // --fresh: remove demo bookings from an earlier seed (identified by their seed payment references) so they are rebuilt
+    // with the current pricing model. Real bookings are never touched.
+    if (process.argv.includes('--fresh')) {
+      const seeded = await BookingPayment.findAll({ where: { paystackReference: { [db.Sequelize.Op.like]: 'homie-seed-%' } }, attributes: ['bookingId'], raw: true });
+      const ids = seeded.map((r) => r.bookingId);
+      if (ids.length) {
+        await BookingReview.destroy({ where: { bookingId: ids } });
+        await BookingPayment.destroy({ where: { bookingId: ids } });
+        await Booking.destroy({ where: { id: ids } });
+        console.log(`Removed ${ids.length} old demo bookings`);
+      }
+    }
     const counters = { F: 0, M: 0 };
     const perCuisine = {};
     const hirers = [];
 
     for (const h of HIRERS) {
       const [member] = await Member.findOrCreate({ where: { phone: h.phone }, defaults: { ...h, activeRole: 'hirer' } });
-      await member.update({ firstName: h.firstName, lastName: h.lastName, email: h.email, address: h.address, lat: h.lat, lng: h.lng, avatarUrl: portrait(h.firstName === 'Tobi' ? 'M' : 'F', h.firstName === 'Tobi' ? 71 : h.firstName === 'Ngozi' ? 90 : 87) });
+      await member.update({ firstName: h.firstName, lastName: h.lastName, email: h.email, address: h.address, lat: h.lat, lng: h.lng, dateOfBirth: '1990-05-14', emailVerifiedAt: new Date(), kycStatus: 'approved', avatarUrl: portrait(h.firstName === 'Tobi' ? 'M' : 'F', h.firstName === 'Tobi' ? 71 : h.firstName === 'Ngozi' ? 90 : 87) });
       hirers.push(member);
     }
 
@@ -123,8 +142,8 @@ const phoneFor = (i) => `+23480000000${String(i + 1).padStart(2, '0')}`;
         defaults: { phone: phoneFor(i), firstName: first, lastName: rest.join(' '), activeRole: 'chef', isChef: true },
       });
       await member.update({
-        firstName: first, lastName: rest.join(' '), isChef: true, activeRole: 'chef',
-        email: `${first}.${rest.join('').replace(/\s/g, '')}@example.com`.toLowerCase(),
+        firstName: first, lastName: rest.join(' '), isChef: true, activeRole: 'chef', kycStatus: 'approved', dateOfBirth: '1988-03-21',
+        email: `${first}.${rest.join('').replace(/\s/g, '')}@demo.homie.app`.toLowerCase(), emailVerifiedAt: new Date(),
         avatarUrl: portrait(gender, avatarNumber), address: `${area}, Lagos`, lat: jitter(lat, i), lng: jitter(lng, i + 2),
       });
 
@@ -132,38 +151,42 @@ const phoneFor = (i) => `+23480000000${String(i + 1).padStart(2, '0')}`;
         displayName: name, bio, cuisines, tags: [...new Set([...cuisines, ...tags])], yearsExperience: years, eventsCooked: events,
         replyTime: reply, area: `${area}, Lagos`, lat: jitter(lat, i), lng: jitter(lng, i + 2),
         coverUrl: photo(pool[(k * 2) % pool.length]), portfolio,
-        verificationStatus: 'verified', verifiedAt: new Date(), available: true,
-        startingPrice: Math.min(...prices),
-        startingUnit: ['dish', 'event', 'hour'][prices.indexOf(Math.min(...prices))],
+        verificationStatus: 'approved', verifiedAt: new Date(), available: true,
+        tier: tierOf(name), startingPrice: settings.tiers[tierOf(name)].customerRate, startingUnit: 'hour',
       };
       let chef = await ChefProfile.findOne({ where: { memberId: member.id } });
       if (chef) await chef.update(profileFields);
       else chef = await ChefProfile.create({ memberId: member.id, ...profileFields });
 
-      // Menu: rebuilt on every run unless bookings already reference the existing services.
-      if (!(await Booking.count({ where: { chefId: chef.id } }))) {
-        await ChefService.destroy({ where: { chefId: chef.id } });
-        const [dishCopy, eventCopy] = SERVICE_COPY[main];
-        await ChefService.bulkCreate([
-          { chefId: chef.id, title: 'Per dish', description: dishCopy, price: prices[0], unit: 'dish', icon: 'restaurant-outline', sortOrder: 0 },
-          { chefId: chef.id, title: 'Private dinner', description: eventCopy, price: prices[1], unit: 'event', icon: 'sparkles-outline', sortOrder: 1 },
-          { chefId: chef.id, title: 'Hourly cooking', description: 'Minimum 3 hours', price: prices[2], unit: 'hour', icon: 'time-outline', sortOrder: 2 },
-        ]);
-      }
+      // KYC record: demo chefs are fully cleared (no document files are attached to demo data).
+      await ChefKyc.findOrCreate({
+        where: { chefId: chef.id },
+        defaults: {
+          chefId: chef.id, dateOfBirth: '1988-03-21', residentialAddress: `${area}, Lagos`, idType: 'NIN', idLast4: '4821',
+          references: [
+            { name: 'Chef Bola Ade', phone: '+2348030000001', relationship: 'Former head chef', company: 'Lagos Grill House' },
+            { name: 'Mrs Ife Johnson', phone: '+2348030000002', relationship: 'Repeat private client', company: null },
+          ],
+          backgroundCheck: { status: 'clear', note: 'Demo data', at: new Date().toISOString() },
+          practicalAssessment: { status: 'passed', score: 88, note: 'Demo data', at: new Date().toISOString() },
+          agreement: { version: '2026-11', fullName: name, acceptedAt: new Date().toISOString(), ip: null },
+          submittedAt: new Date(), reviewedAt: new Date(),
+        },
+      });
       stats.chefs += 1;
 
       // Reviews: one completed, paid and released booking per demo hirer, each with a review.
       if (!(await BookingReview.count({ where: { chefId: chef.id } }))) {
-        const service = await ChefService.findOne({ where: { chefId: chef.id, unit: 'event' } });
+        const tier = tierOf(name);
         const ratings = [5, 5, i % 3 === 0 ? 4 : 5];
         for (const [h, hirer] of hirers.entries()) {
-          const pricing = computePricing({ unitPrice: service.price, quantity: 1, groceries: 15000 + h * 5000 });
+          const pricing = pricingSvc.computeChefTime(settings, { tier, hours: 3 });
           const when = new Date(Date.now() - (20 + h * 17 + (i % 9)) * 24 * 3600 * 1000);
           refCounter += 1;
           const booking = await Booking.create({
-            reference: `HM-${refCounter}`, hirerId: hirer.id, chefId: chef.id, serviceId: service.id,
-            serviceTitle: service.title, serviceUnit: service.unit, unitPrice: service.price, quantity: 1,
-            scheduledAt: when, guests: 8 + h * 2, address: hirer.address, ...pricing, status: 'completed',
+            reference: `HM-${refCounter}`, hirerId: hirer.id, chefId: chef.id, serviceId: null,
+            serviceLine: 'chef_time', serviceTitle: 'Chef Time', serviceUnit: 'hour', unitPrice: pricing.hourlyRate, quantity: 3,
+            scheduledAt: when, guests: 8 + h * 2, address: hirer.address, ...pricing, groceries: 0, status: 'completed',
             paidAt: new Date(when.getTime() - 5 * 24 * 3600 * 1000), acceptedAt: new Date(when.getTime() - 4 * 24 * 3600 * 1000),
             startedAt: when, completedAt: new Date(when.getTime() + 4 * 3600 * 1000), approvedAt: new Date(when.getTime() + 6 * 3600 * 1000),
             releasedAt: new Date(when.getTime() + 6 * 3600 * 1000),

@@ -2,7 +2,7 @@
 
 const STATUSES = [
   'awaiting_payment', 'pending_chef', 'confirmed', 'in_progress', 'awaiting_approval',
-  'completed', 'cancelled', 'declined', 'disputed', 'expired',
+  'completed', 'cancelled', 'declined', 'disputed', 'expired', 'scheduled', 'pending_allocation',
 ];
 
 module.exports = (sequelize, DataTypes) => {
@@ -10,7 +10,7 @@ module.exports = (sequelize, DataTypes) => {
     id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
     reference: { type: DataTypes.STRING(20), allowNull: false, unique: true },
     hirerId: { type: DataTypes.UUID, allowNull: false, references: { model: 'Members', key: 'id' } },
-    chefId: { type: DataTypes.UUID, allowNull: false, references: { model: 'ChefProfiles', key: 'id' } },
+    chefId: { type: DataTypes.UUID, allowNull: true, references: { model: 'ChefProfiles', key: 'id' } }, // null while a "Match me" booking awaits allocation
     serviceId: { type: DataTypes.UUID, allowNull: true, references: { model: 'ChefServices', key: 'id' } },
     serviceTitle: { type: DataTypes.STRING(150), allowNull: false },
     serviceUnit: { type: DataTypes.STRING(20), allowNull: false },
@@ -36,6 +36,28 @@ module.exports = (sequelize, DataTypes) => {
     cancelledAt: { type: DataTypes.DATE, allowNull: true },
     cancelReason: { type: DataTypes.TEXT, allowNull: true },
     autoReleaseAt: { type: DataTypes.DATE, allowNull: true },
+    serviceLine: { type: DataTypes.ENUM('chef_time', 'chef_ingredients'), allowNull: false, defaultValue: 'chef_time' },
+    tier: { type: DataTypes.ENUM('standard', 'premium', 'elite'), allowNull: false, defaultValue: 'standard' },
+    serviceFee: { type: DataTypes.DECIMAL(15, 2), allowNull: false, defaultValue: 0 },
+    ingredientsAmount: { type: DataTypes.DECIMAL(15, 2), allowNull: false, defaultValue: 0 },
+    logisticsAmount: { type: DataTypes.DECIMAL(15, 2), allowNull: false, defaultValue: 0 },
+    platformFee: { type: DataTypes.DECIMAL(15, 2), allowNull: false, defaultValue: 0 },
+    lineItems: { type: DataTypes.JSONB, allowNull: true },
+    recurrence: { type: DataTypes.ENUM('once', 'weekly', 'monthly'), allowNull: false, defaultValue: 'once' },
+    seriesId: { type: DataTypes.UUID, allowNull: true },
+    seriesIndex: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 1 },
+    seriesTotal: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 1 },
+    preAccepted: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    matchRequested: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
+    cuisine: { type: DataTypes.STRING(60), allowNull: true },
+    allocatedAt: { type: DataTypes.DATE, allowNull: true },
+    allocatedByAdminId: { type: DataTypes.UUID, allowNull: true, references: { model: 'Admins', key: 'id' } },
+    payByAt: { type: DataTypes.DATE, allowNull: true },
+    quoteId: { type: DataTypes.UUID, allowNull: true },
+    procurementStatus: { type: DataTypes.ENUM('not_required', 'pending', 'purchasing', 'purchased', 'delivered'), allowNull: false, defaultValue: 'not_required' },
+    procurementNotes: { type: DataTypes.TEXT, allowNull: true },
+    ingredientsActualCost: { type: DataTypes.DECIMAL(15, 2), allowNull: true },
+    procurementReceipts: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
   }, { tableName: 'Bookings', timestamps: true });
 
   Booking.STATUSES = STATUSES;

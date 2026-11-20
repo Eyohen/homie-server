@@ -8,7 +8,7 @@ const { memberName, bookingView, num } = require('../utils/homieSerializers');
 
 const { Member, ChefProfile, Booking, BookingPayment, Dispute, ChatMessage, ChatThread, PayoutAccount, AuditLog, BookingReview } = db;
 
-const PAID_STATUSES = ['pending_chef', 'confirmed', 'in_progress', 'awaiting_approval', 'completed', 'disputed'];
+const PAID_STATUSES = ['pending_allocation', 'pending_chef', 'confirmed', 'in_progress', 'awaiting_approval', 'completed', 'disputed'];
 
 const audit = (req, action, entity, entityId, { previous, next, description } = {}) =>
   AuditLog.create({
@@ -63,12 +63,16 @@ exports.overview = wrap(async (req, res) => {
     WHERE b.status IN (${paid}) GROUP BY 1 ORDER BY 2 DESC LIMIT 5`);
   const pipeline = await q(`SELECT status, COUNT(*) AS count FROM "Bookings" GROUP BY status`);
 
-  const [pendingVerifications, flagged, failedPayouts, refundsPending, waitingPayouts] = await Promise.all([
+  const [pendingVerifications, flagged, failedPayouts, refundsPending, waitingPayouts, pendingAllocation, quotesWaiting, procurementPending, customerIdPending] = await Promise.all([
     ChefProfile.count({ where: { verificationStatus: 'pending' } }),
     ChatMessage.count({ where: { flagged: true, reviewedAt: null } }),
     BookingPayment.count({ where: { payoutStatus: 'failed' } }),
     BookingPayment.count({ where: { status: 'refund_pending' } }),
     BookingPayment.count({ where: { status: 'released', payoutStatus: 'pending' } }),
+    Booking.count({ where: { status: 'pending_allocation' } }),
+    db.Quote.count({ where: { status: 'requested' } }),
+    Booking.count({ where: { serviceLine: 'chef_ingredients', procurementStatus: { [Op.in]: ['pending', 'purchasing'] }, status: { [Op.notIn]: ['awaiting_payment', 'cancelled', 'declined', 'expired'] } } }),
+    Member.count({ where: { idSubmittedAt: { [Op.ne]: null }, idVerifiedAt: null } }),
   ]);
 
   const paidBookings = Number(money.paidBookings);
@@ -90,6 +94,7 @@ exports.overview = wrap(async (req, res) => {
       needsAttention: {
         openDisputes: Number(disputes.open), pendingVerifications, flaggedMessages: flagged,
         failedPayouts, refundsPending, payoutsWaitingForAccount: waitingPayouts,
+        pendingAllocation, quotesWaiting, procurementPending, customerIdPending,
       },
     },
   });
@@ -163,52 +168,6 @@ exports.setUserStatus = wrap(async (req, res) => {
   });
   audit(req, status === 'suspended' ? 'user_suspended' : 'user_activated', 'Member', member.id, { previous: { status: previous }, next: { status }, description: reason });
   return res.json({ success: true, data: { user: memberRow(member) } });
-});
-
-// ----------------------------------------------------------- verification
-
-const verificationRow = (c) => ({
-  chefId: c.id,
-  name: c.displayName,
-  phone: c.member?.phone,
-  email: c.member?.email,
-  avatarUrl: c.member?.avatarUrl,
-  cuisines: c.cuisines,
-  area: c.area,
-  verificationStatus: c.verificationStatus,
-  verificationNote: c.verificationNote,
-  verificationData: c.verificationData,
-  portfolio: c.portfolio,
-  createdAt: c.createdAt,
-});
-
-exports.listVerifications = wrap(async (req, res) => {
-  const p = paging(req);
-  const { rows, count } = await ChefProfile.findAndCountAll({
-    where: { verificationStatus: req.query.status || 'pending' },
-    include: [{ model: Member, as: 'member', attributes: ['phone', 'email', 'avatarUrl'] }],
-    order: [['updatedAt', 'ASC']], limit: p.limit, offset: p.offset,
-  });
-  return res.json({ success: true, data: { chefs: rows.map(verificationRow), pagination: pageInfo(p, count) } });
-});
-
-exports.decideVerification = wrap(async (req, res) => {
-  const { approve, note } = req.body;
-  if (typeof approve !== 'boolean') return res.status(400).json({ success: false, message: 'approve must be true or false' });
-  if (!approve && !String(note || '').trim()) return res.status(400).json({ success: false, message: 'Tell the chef why they were rejected' });
-
-  const chef = await ChefProfile.findByPk(req.params.chefId);
-  if (!chef) return res.status(404).json({ success: false, message: 'Chef not found' });
-  if (chef.verificationStatus !== 'pending') return res.status(409).json({ success: false, message: 'This chef has no pending verification' });
-
-  await chef.update({
-    verificationStatus: approve ? 'verified' : 'rejected', verificationNote: approve ? null : String(note).trim(), verifiedAt: approve ? new Date() : null,
-  });
-  audit(req, approve ? 'chef_verified' : 'chef_rejected', 'ChefProfile', chef.id, { next: { approve }, description: note });
-  notify(chef.memberId, approve
-    ? { type: 'verification', title: "You're verified", body: 'Hirers can now find and book you on Homie.' }
-    : { type: 'verification', title: 'Verification needs attention', body: String(note).trim() });
-  return res.json({ success: true, data: { chef: verificationRow(chef) } });
 });
 
 // ---------------------------------------------------------------- bookings

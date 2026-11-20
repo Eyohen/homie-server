@@ -166,7 +166,7 @@ const startServer = async () => {
 
     // Auto-release escrow, expire unpaid bookings, time out silent chefs, retry payouts.
     if (process.env.HOMIE_JOBS !== 'off') {
-      const run = () => bookingService.runScheduledJobs().then((s) => {
+      const run = () => require('./services/bookingFlows.service').runScheduledJobs().then((s) => {
         if (Object.values(s).some(Boolean)) console.log('Scheduled jobs:', s);
       });
       setTimeout(run, 15 * 1000);

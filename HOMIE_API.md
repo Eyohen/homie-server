@@ -1,5 +1,9 @@
 # Homie API
 
+> **Business model (Nov 2026):** Homie is a managed marketplace. Chef Time is priced by chef tier (rates in the `PricingSettings` table, editable in the admin
+> Pricing page); Chef + Ingredients is quoted by staff; customers can pick a chef or tap "Match me" and an admin allocates one; chefs go through full KYC.
+> Design and decisions: `docs/superpowers/specs/2026-11-20-business-model-restructure-design.md`.
+
 Mobile app API lives under `/api/app`; the back-office API under `/api/admin-homie` (admin token from `POST /api/admin-auth/login`).
 All responses are `{ success, message?, data? }`. Authenticated routes need `Authorization: Bearer <accessToken>`.
 
@@ -55,3 +59,29 @@ Disputes on bookings above `HOMIE_DUAL_APPROVAL_THRESHOLD` (₦50,000) need two 
 - OTP SMS needs a real provider (`SMS_PROVIDER=termii` is wired but untested) — `console` only logs.
 - Staff management / custom roles, support tickets, promo codes and city management are not built.
 - Refresh tokens allow one signed-in device per account (a new sign-in revokes the old one).
+
+
+## Chef Time, Match me, quotes and KYC (added Nov 2026)
+**App (`/api/app`)**
+| | |
+|---|---|
+| `GET /config` | tier hourly rates, minimum hours, service fee, max recurring sessions (public) |
+| `POST /bookings/price` `{chefId? \| tier, hours, recurrence?, sessions?}` | price preview (per session + series total) |
+| `POST /bookings` `{chefId? \| tier, cuisine?, hours, scheduledAt, recurrence: once\|weekly\|monthly, sessions?, address, guests?, notes?}` | Chef Time. No `chefId` = "Match me" (waits in the allocation queue after payment). Needs customer KYC basics (403 `KYC_REQUIRED`, `ID_REQUIRED`). |
+| `POST /bookings/:id/cancel` `{reason?, wholeSeries?}` | cancel one session or every unstarted session of a series |
+| `POST /quotes` · `GET /quotes` · `GET /quotes/:id` · `POST /quotes/:id/approve\|decline` | Chef + Ingredients: menu request → staff quotation → approve (creates the booking to pay) |
+| `GET /kyc` · `PUT /kyc/profile` · `POST /kyc/id` | customer KYC: name, DOB (18+), address, verified email; ID for large bookings |
+| `GET /chef-kyc` · `PUT /chef-kyc/profile\|documents\|references` · `POST /chef-kyc/agreement\|submit` | chef application. Documents are private references from `POST /uploads?kind=kyc` (PDF or image) |
+
+**Chef statuses:** `registered → pending → verified → approved` (also `suspended`, `rejected`). Only `approved` chefs are listed or bookable.
+**Booking statuses** add `scheduled` (future series session) and `pending_allocation` ("Match me", paid, no chef yet).
+
+**Admin (`/api/admin-homie`)**
+`GET|PUT /pricing` · `GET /allocations` · `GET /bookings/:id/candidates` · `POST /bookings/:id/allocate` · `GET /quotes` · `POST /quotes/preview|:id/quote|:id/reject` ·
+`GET /procurement` · `POST /bookings/:id/procurement` · `GET /chef-kyc[/:chefId]` · `POST /chef-kyc/:chefId/items/:item|background|practical|verify|approve|reject|suspend|reinstate|tier` ·
+`GET /customer-kyc` · `POST /customer-kyc/:memberId/decision`
+
+## Deploying (Railway)
+Migrations run on start (`prestart`). New environment variables (all optional): `DEMO_OTP_CODE` (fixed sign-in code for the *existing seeded demo accounts only*; in production it also needs `ALLOW_DEMO_OTP=true`),
+`HOMIE_ALLOCATION_DEADLINE_HOURS`, `HOMIE_REQUIRE_PHONE`. Sign-in codes by email need a verified sender domain in Resend (`RESEND_FROM_EMAIL`).
+After the first deploy of this version run `npm run homie:reseed` against the production database to rebuild demo data in the new pricing model.

@@ -2,6 +2,7 @@ const { Op, literal, where: sqlWhere } = require('sequelize');
 const db = require('../../models');
 const { chefSummary, serviceView, reviewView, num } = require('../../utils/homieSerializers');
 const { unavailableDays } = require('../../services/booking.service');
+const pricing = require('../../services/pricing.service');
 
 const { ChefProfile, ChefService, Member, BookingReview, Favorite } = db;
 
@@ -28,7 +29,8 @@ exports.list = async (req, res) => {
     const lng = parseCoord(req.query.lng) ?? num(req.member?.lng);
     const hasPoint = lat !== null && lng !== null;
 
-    const and = [{ verificationStatus: 'verified' }];
+    const and = [{ verificationStatus: 'approved' }];
+    if (pricing.TIERS.includes(req.query.tier)) and.push({ tier: req.query.tier });
     if (cuisine && cuisine !== 'All') and.push({ cuisines: { [Op.contains]: [String(cuisine)] } });
     if (minRating) and.push({ ratingAvg: { [Op.gte]: minRating } });
     if (q && String(q).trim()) {
@@ -81,11 +83,10 @@ exports.detail = async (req, res) => {
     const chef = await ChefProfile.findByPk(req.params.id, {
       include: [
         { model: Member, as: 'member', attributes: ['id', 'avatarUrl', 'status'] },
-        { model: ChefService, as: 'services', where: { active: true }, required: false },
       ],
     });
     const isOwner = req.member && chef && chef.memberId === req.member.id;
-    if (!chef || (!isOwner && (chef.verificationStatus !== 'verified' || chef.member.status !== 'active'))) {
+    if (!chef || (!isOwner && (chef.verificationStatus !== 'approved' || chef.member.status !== 'active'))) {
       return res.status(404).json({ success: false, message: 'Chef not found' });
     }
 
@@ -95,6 +96,7 @@ exports.detail = async (req, res) => {
       order: [['createdAt', 'DESC']],
       limit: 5,
     });
+    const settings = await pricing.getSettings();
     const from = new Date();
     const to = new Date(Date.now() + 90 * 24 * 3600 * 1000);
     const [unavailable, favorite] = await Promise.all([
@@ -109,7 +111,8 @@ exports.detail = async (req, res) => {
           ...chefSummary(chef, { isFavorite: favorite > 0 }),
           bio: chef.bio,
           portfolio: chef.portfolio,
-          services: chef.services.sort((a, b) => a.sortOrder - b.sortOrder).map(serviceView),
+          // Homie sets prices by tier; chefs no longer publish their own menu prices.
+          rate: { tier: chef.tier, hourly: settings.tiers[chef.tier].customerRate, minHours: settings.minHours, serviceFeeRate: settings.serviceFeeRate },
           reviews: reviews.map(reviewView),
           unavailableDays: unavailable,
         },

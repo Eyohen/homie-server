@@ -17,13 +17,15 @@ module.exports = (sequelize, DataTypes) => {
     coverUrl: { type: DataTypes.STRING(500), allowNull: true },
     portfolio: { type: DataTypes.JSONB, allowNull: false, defaultValue: [] },
     verificationStatus: {
-      type: DataTypes.ENUM('unsubmitted', 'pending', 'verified', 'rejected'),
+      // registered -> pending (KYC submitted) -> verified (checks complete) -> approved (cleared to work). Also suspended / rejected.
+      type: DataTypes.ENUM('unsubmitted', 'registered', 'pending', 'verified', 'approved', 'suspended', 'rejected'),
       allowNull: false,
-      defaultValue: 'unsubmitted',
+      defaultValue: 'registered',
     },
     verificationData: { type: DataTypes.JSONB, allowNull: true },
     verificationNote: { type: DataTypes.TEXT, allowNull: true },
     verifiedAt: { type: DataTypes.DATE, allowNull: true },
+    tier: { type: DataTypes.ENUM('standard', 'premium', 'elite'), allowNull: false, defaultValue: 'standard' },
     available: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: true },
     ratingAvg: { type: DataTypes.DECIMAL(3, 2), allowNull: false, defaultValue: 0 },
     ratingCount: { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 },
@@ -38,6 +40,7 @@ module.exports = (sequelize, DataTypes) => {
     ChefProfile.hasOne(models.PayoutAccount, { foreignKey: 'chefId', as: 'payoutAccount' });
     ChefProfile.hasMany(models.Booking, { foreignKey: 'chefId', as: 'bookings' });
     ChefProfile.hasMany(models.BookingReview, { foreignKey: 'chefId', as: 'reviews' });
+    ChefProfile.hasOne(models.ChefKyc, { foreignKey: 'chefId', as: 'kyc' });
   };
 
   return ChefProfile;

@@ -28,6 +28,19 @@ const normalizeEmail = (raw) => {
   return /^\S+@\S+\.\S+$/.test(email) ? email : null;
 };
 
+// Seeded demo accounts (npm run homie:seed). When DEMO_OTP_CODE is set, only these accept that fixed code,
+// so the deployed demo can be used without email/SMS delivery. Real users are never affected.
+// Only enabled when DEMO_OTP_CODE is set, and in production only with ALLOW_DEMO_OTP=true as well.
+// It applies to EXISTING seeded demo accounts only (never to new or unknown identifiers).
+const DEMO_PHONE = /^\+2348000000(0[1-9]|1\d|2[0-4])$|^\+2348100000(0[1-3])$/;
+const demoEnabled = () => !!process.env.DEMO_OTP_CODE && (process.env.NODE_ENV !== 'production' || process.env.ALLOW_DEMO_OTP === 'true');
+const isDemoAccount = async (field, target) => {
+  if (!demoEnabled()) return false;
+  const member = await Member.findOne({ where: { [field]: target }, attributes: ['id', 'email', 'phone'] });
+  if (!member) return false;
+  return /@demo\.homie\.app$/i.test(member.email || '') || DEMO_PHONE.test(member.phone || '');
+};
+
 const resolveTarget = (body) => {
   if (body.phone) {
     const phone = normalizePhone(body.phone);
@@ -55,7 +68,7 @@ exports.requestOtp = async (req, res) => {
   try {
     const resolved = resolveTarget(req.body);
     if (resolved.error) return res.status(400).json({ success: false, message: resolved.error });
-    const { channel, target } = resolved;
+    const { channel, target, field } = resolved;
 
     const last = await OtpCode.findOne({ where: { target }, order: [['createdAt', 'DESC']] });
     if (last && Date.now() - new Date(last.createdAt).getTime() < cfg.OTP_RESEND_SECONDS * 1000) {
@@ -66,14 +79,17 @@ exports.requestOtp = async (req, res) => {
       return res.status(429).json({ success: false, message: 'Too many codes requested. Try again later.' });
     }
 
-    const code = String(crypto.randomInt(100000, 1000000));
+    const demo = await isDemoAccount(field, target);
+    const code = demo ? String(process.env.DEMO_OTP_CODE) : String(crypto.randomInt(100000, 1000000));
     await OtpCode.create({
       target, channel, codeHash: await bcrypt.hash(code, 8),
       expiresAt: new Date(Date.now() + cfg.OTP_TTL_MINUTES * 60 * 1000),
     });
 
     const message = `Your Homie code is ${code}. It expires in ${cfg.OTP_TTL_MINUTES} minutes.`;
-    if (channel === 'sms') {
+    if (demo) {
+      // fixed demo code: nothing to send
+    } else if (channel === 'sms') {
       await sms.send(target, message);
     } else {
       await emailService.sendEmail({
@@ -121,7 +137,9 @@ exports.verifyOtp = async (req, res) => {
     let member = await Member.findOne({ where: { [field]: target } });
     const isNewUser = !member;
     if (!member) {
-      member = await Member.create({ [field]: target, activeRole: 'hirer' });
+      member = await Member.create({ [field]: target, activeRole: 'hirer', ...(field === 'email' ? { emailVerifiedAt: new Date() } : {}) });
+    } else if (field === 'email' && !member.emailVerifiedAt) {
+      await member.update({ emailVerifiedAt: new Date() }); // the code proves they own this address
     }
     if (member.status !== 'active') {
       return res.status(403).json({ success: false, message: 'Your account is not active', code: 'ACCOUNT_SUSPENDED' });

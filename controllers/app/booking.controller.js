@@ -1,6 +1,7 @@
 const { Op } = require('sequelize');
 const db = require('../../models');
 const svc = require('../../services/booking.service');
+const flows = require('../../services/bookingFlows.service');
 const { bookingView } = require('../../utils/homieSerializers');
 
 const { Booking, BookingPayment, ChefProfile, Member, BookingReview, Dispute } = db;
@@ -13,14 +14,16 @@ const include = [
   { model: Dispute, as: 'disputes', required: false },
 ];
 
-const ACTIVE = ['awaiting_payment', 'pending_chef', 'confirmed', 'in_progress', 'awaiting_approval', 'disputed'];
+const ACTIVE = ['awaiting_payment', 'scheduled', 'pending_allocation', 'pending_chef', 'confirmed', 'in_progress', 'awaiting_approval', 'disputed'];
+// Chefs only see bookings that are paid and assigned to them.
+const CHEF_HIDDEN = ['awaiting_payment', 'scheduled', 'pending_allocation'];
 
 const handle = (fn) => async (req, res) => {
   try {
     await fn(req, res);
   } catch (error) {
     if (error.status) {
-      return res.status(error.status).json({ success: false, message: error.message, ...(error.code ? { code: error.code } : {}) });
+      return res.status(error.status).json({ success: false, message: error.message, ...(error.code ? { code: error.code } : {}), ...(error.details ? { details: error.details } : {}) });
     }
     console.error(`${req.method} ${req.originalUrl} error:`, error);
     return res.status(500).json({ success: false, message: 'Something went wrong' });
@@ -36,9 +39,21 @@ const sideOf = async (req, booking) => {
 
 const reload = (id) => Booking.findByPk(id, { include });
 
+// Chef Time booking (optionally a weekly/monthly series). Omit chefId and pass tier for "Match me".
 exports.create = handle(async (req, res) => {
-  const booking = await svc.createBooking(req.member, req.body);
-  return res.status(201).json({ success: true, data: { booking: bookingView(await reload(booking.id), 'hirer') } });
+  const { booking, series } = await flows.createChefTimeBooking(req.member, req.body);
+  const full = await reload(booking.id);
+  return res.status(201).json({
+    success: true,
+    data: {
+      booking: bookingView(full, 'hirer'),
+      series: series.map((s) => ({ id: s.id, reference: s.reference, status: s.status, scheduledAt: s.scheduledAt, index: s.seriesIndex })),
+    },
+  });
+});
+
+exports.price = handle(async (req, res) => {
+  return res.json({ success: true, data: await flows.previewChefTime(req.body) });
 });
 
 exports.pay = handle(async (req, res) => {
@@ -70,13 +85,13 @@ exports.list = handle(async (req, res) => {
     if (!chef) return res.json({ success: true, data: { bookings: [], pagination: { page: 1, limit: 0, total: 0, pages: 0 } } });
     where.chefId = chef.id;
     // Chefs never see bookings that have not been paid.
-    where.status = { [Op.ne]: 'awaiting_payment' };
+    where.status = { [Op.notIn]: CHEF_HIDDEN };
   } else {
     where.hirerId = req.member.id;
   }
 
   const { status } = req.query;
-  if (status === 'active') where.status = { [Op.in]: ACTIVE.filter((s) => as !== 'chef' || s !== 'awaiting_payment') };
+  if (status === 'active') where.status = { [Op.in]: ACTIVE.filter((s) => as !== 'chef' || !CHEF_HIDDEN.includes(s)) };
   else if (status === 'past') where.status = { [Op.in]: ['completed', 'cancelled', 'declined', 'expired'] };
   else if (status && Booking.STATUSES.includes(status)) where.status = status;
 
@@ -96,8 +111,13 @@ exports.get = handle(async (req, res) => {
   if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' });
   const side = await sideOf(req, booking);
   if (!side) return res.status(403).json({ success: false, message: 'Not your booking' });
-  if (side === 'chef' && booking.status === 'awaiting_payment') return res.status(404).json({ success: false, message: 'Booking not found' });
-  return res.json({ success: true, data: { booking: bookingView(booking, side) } });
+  if (side === 'chef' && CHEF_HIDDEN.includes(booking.status)) return res.status(404).json({ success: false, message: 'Booking not found' });
+  let seriesBookings = null;
+  if (booking.seriesId) {
+    const siblings = await Booking.findAll({ where: { seriesId: booking.seriesId }, order: [['seriesIndex', 'ASC']] });
+    seriesBookings = siblings.map((s) => ({ id: s.id, reference: s.reference, status: s.status, scheduledAt: s.scheduledAt, index: s.seriesIndex, total: Number(s.total) }));
+  }
+  return res.json({ success: true, data: { booking: bookingView(booking, side), series: seriesBookings } });
 });
 
 const chefAction = (fn) => handle(async (req, res) => {
@@ -118,7 +138,7 @@ exports.approve = hirerAction((req) => svc.approveBooking(req.params.id, { hirer
 
 exports.cancel = handle(async (req, res) => {
   const chef = await ChefProfile.findOne({ where: { memberId: req.member.id }, attributes: ['id'] });
-  const booking = await svc.cancelBooking(req.params.id, { member: req.member, chef, reason: req.body.reason });
+  const booking = await svc.cancelBooking(req.params.id, { member: req.member, chef, reason: req.body.reason, wholeSeries: !!req.body.wholeSeries });
   const full = await reload(booking.id);
   return res.json({ success: true, data: { booking: bookingView(full, full.hirerId === req.member.id ? 'hirer' : 'chef') } });
 });

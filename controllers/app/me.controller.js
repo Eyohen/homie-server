@@ -17,10 +17,10 @@ const strList = (value, max = 20) =>
 // ------------------------------------------------------------------ member
 
 exports.getMe = async (req, res) => {
-  const chef = await ChefProfile.findOne({ where: { memberId: req.member.id }, attributes: ['id', 'verificationStatus'] });
+  const chef = await ChefProfile.findOne({ where: { memberId: req.member.id }, attributes: ['id', 'verificationStatus', 'tier'] });
   return res.json({
     success: true,
-    data: { member: memberPublic(req.member), chef: chef ? { id: chef.id, verificationStatus: chef.verificationStatus } : null },
+    data: { member: memberPublic(req.member), chef: chef ? { id: chef.id, verificationStatus: chef.verificationStatus, tier: chef.tier } : null },
   });
 };
 
@@ -91,7 +91,7 @@ exports.verifyEmailChange = async (req, res) => {
     await otp.update({ consumedAt: new Date() });
 
     try {
-      await req.member.update({ email });
+      await req.member.update({ email, emailVerifiedAt: new Date() });
     } catch (error) {
       if (error.name === 'SequelizeUniqueConstraintError') return bad(res, 'That email is already in use', 409);
       throw error;
@@ -126,7 +126,6 @@ exports.registerPushToken = async (req, res) => {
 // -------------------------------------------------------------------- chef
 
 const chefInclude = [
-  { model: ChefService, as: 'services', where: { active: true }, required: false },
   { model: ChefBlockedDate, as: 'blockedDates', where: { date: { [Op.gte]: lagosDayKey(new Date()) } }, required: false },
   { model: PayoutAccount, as: 'payoutAccount', required: false },
 ];
@@ -152,7 +151,7 @@ const ownChefView = (chef) => ({
   reviewCount: chef.ratingCount,
   verificationStatus: chef.verificationStatus,
   verificationNote: chef.verificationNote,
-  services: (chef.services || []).sort((a, b) => a.sortOrder - b.sortOrder).map(serviceView),
+  tier: chef.tier,
   blockedDates: (chef.blockedDates || []).map((d) => d.date).sort(),
   payoutAccount: chef.payoutAccount
     ? { bankCode: chef.payoutAccount.bankCode, bankName: chef.payoutAccount.bankName, accountName: chef.payoutAccount.accountName, accountNumber: maskAccount(chef.payoutAccount.accountNumber) }
@@ -203,50 +202,6 @@ exports.upsertChefProfile = async (req, res) => {
   } catch (error) {
     console.error('upsertChefProfile error:', error);
     return bad(res, 'Could not save chef profile', 500);
-  }
-};
-
-const ICONS = { dish: 'restaurant-outline', event: 'sparkles-outline', hour: 'time-outline', order: 'cafe-outline' };
-
-// Replaces the chef's service list. Removed services are deactivated (existing bookings reference them).
-exports.setServices = async (req, res) => {
-  try {
-    const items = req.body.services;
-    if (!Array.isArray(items) || items.length > 12) return bad(res, 'Provide up to 12 services');
-
-    for (const item of items) {
-      if (!item.title || !String(item.title).trim()) return bad(res, 'Every service needs a title');
-      if (!(Number(item.price) > 0)) return bad(res, `Set a price for "${item.title}"`);
-      if (!['dish', 'event', 'hour', 'order'].includes(item.unit)) return bad(res, `Invalid unit for "${item.title}"`);
-    }
-
-    await db.sequelize.transaction(async (transaction) => {
-      const existing = await ChefService.findAll({ where: { chefId: req.chef.id }, transaction });
-      const keep = new Set();
-      for (const [index, item] of items.entries()) {
-        const fields = {
-          title: String(item.title).trim().slice(0, 150),
-          description: item.desc || item.description ? String(item.desc || item.description).trim() : null,
-          price: Number(item.price), unit: item.unit, icon: item.icon || ICONS[item.unit], active: true, sortOrder: index,
-        };
-        const match = item.id && existing.find((s) => s.id === item.id);
-        if (match) {
-          await match.update(fields, { transaction });
-          keep.add(match.id);
-        } else {
-          const created = await ChefService.create({ chefId: req.chef.id, ...fields }, { transaction });
-          keep.add(created.id);
-        }
-      }
-      await ChefService.update({ active: false }, { where: { chefId: req.chef.id, id: { [Op.notIn]: [...keep] } }, transaction });
-
-      const cheapest = items.slice().sort((a, b) => Number(a.price) - Number(b.price))[0];
-      await req.chef.update({ startingPrice: cheapest ? Number(cheapest.price) : null, startingUnit: cheapest ? cheapest.unit : null }, { transaction });
-    });
-    return res.json({ success: true, data: { chef: ownChefView(await loadOwnChef(req.member.id)) } });
-  } catch (error) {
-    console.error('setServices error:', error);
-    return bad(res, 'Could not save services', 500);
   }
 };
 
@@ -307,38 +262,6 @@ exports.setPayoutAccount = async (req, res) => {
   } catch (error) {
     console.error('setPayoutAccount error:', error);
     return bad(res, 'Could not save payout account', 500);
-  }
-};
-
-// Verification photos must be https images on our own Cloudinary account (uploaded through /api/app/uploads).
-// Without Cloudinary configured (local development) any https URL is accepted.
-const isTrustedImageUrl = (value) => {
-  try {
-    const url = new URL(String(value));
-    if (url.protocol !== 'https:') return false;
-    const cloud = process.env.CLOUDINARY_CLOUD_NAME;
-    if (!cloud || /^(your_cloud_name|xxx+)$/i.test(cloud)) return true;
-    return url.hostname === 'res.cloudinary.com' && url.pathname.startsWith(`/${cloud}/`);
-  } catch (error) {
-    return false;
-  }
-};
-
-exports.submitVerification = async (req, res) => {
-  try {
-    const { idType, idLast4, idPhotoUrl, selfieUrl } = req.body;
-    if (!idType || !idPhotoUrl || !selfieUrl) return bad(res, 'ID type, ID photo and selfie are required');
-    if (!isTrustedImageUrl(idPhotoUrl) || !isTrustedImageUrl(selfieUrl)) return bad(res, 'Photos must be uploaded through Homie. Please upload them again.');
-    if (req.chef.verificationStatus === 'verified') return bad(res, 'You are already verified', 409);
-    await req.chef.update({
-      verificationStatus: 'pending',
-      verificationNote: null,
-      verificationData: { idType: String(idType), idLast4: idLast4 ? String(idLast4).slice(-4) : null, idPhotoUrl, selfieUrl, submittedAt: new Date().toISOString() },
-    });
-    return res.json({ success: true, message: 'Submitted for review', data: { verificationStatus: 'pending' } });
-  } catch (error) {
-    console.error('submitVerification error:', error);
-    return bad(res, 'Could not submit verification', 500);
   }
 };
 

@@ -17,6 +17,10 @@ const memberPublic = (m) => ({
   lat: num(m.lat),
   lng: num(m.lng),
   needsProfile: !m.firstName,
+  dateOfBirth: m.dateOfBirth,
+  emailVerified: !!m.emailVerifiedAt,
+  kycStatus: m.kycStatus,
+  idVerified: !!m.idVerifiedAt,
 });
 
 const serviceView = (s) => ({
@@ -39,7 +43,8 @@ const chefSummary = (chef, { distance, isFavorite } = {}) => ({
   reviewCount: chef.ratingCount,
   area: chef.area,
   distance: distance === undefined || distance === null ? null : Math.round(Number(distance) * 10) / 10,
-  verified: chef.verificationStatus === 'verified',
+  verified: chef.verificationStatus === 'approved',
+  tier: chef.tier,
   years: chef.yearsExperience,
   events: chef.eventsCooked,
   reply: chef.replyTime,
@@ -66,11 +71,27 @@ const maskAddress = (address) => {
 // viewerRole: 'hirer' | 'chef' | 'admin'
 const bookingView = (b, viewerRole = 'hirer') => {
   const payment = (b.payments || []).slice().sort((a, c) => new Date(c.createdAt) - new Date(a.createdAt))[0];
-  const hideAddress = viewerRole === 'chef' && ['awaiting_payment', 'pending_chef'].includes(b.status);
+  const hideAddress = viewerRole === 'chef' && ['awaiting_payment', 'pending_chef', 'pending_allocation', 'scheduled'].includes(b.status);
   const view = {
     id: b.id,
     reference: b.reference,
     status: b.status,
+    serviceLine: b.serviceLine,
+    tier: b.tier,
+    hours: b.serviceLine === 'chef_time' ? b.quantity : null,
+    hourlyRate: b.serviceLine === 'chef_time' ? num(b.unitPrice) : null,
+    serviceFee: num(b.serviceFee),
+    ingredientsAmount: num(b.ingredientsAmount),
+    logisticsAmount: num(b.logisticsAmount),
+    platformFee: num(b.platformFee),
+    lineItems: b.lineItems,
+    recurrence: b.recurrence,
+    series: b.seriesId ? { id: b.seriesId, index: b.seriesIndex, total: b.seriesTotal } : null,
+    matchRequested: b.matchRequested,
+    cuisine: b.cuisine,
+    payByAt: b.payByAt,
+    quoteId: b.quoteId,
+    procurement: b.serviceLine === 'chef_ingredients' ? { status: b.procurementStatus, notes: viewerRole === 'admin' ? b.procurementNotes : undefined, actualCost: viewerRole === 'admin' ? num(b.ingredientsActualCost) : undefined } : null,
     service: { id: b.serviceId, title: b.serviceTitle, unit: b.serviceUnit },
     quantity: b.quantity,
     scheduledAt: b.scheduledAt,

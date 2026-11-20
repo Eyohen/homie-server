@@ -10,13 +10,13 @@ const { Booking, BookingPayment, ChefProfile, ChefService, ChefBlockedDate, Memb
 const HOUR = 60 * 60 * 1000;
 const LAGOS_OFFSET_MS = HOUR; // Africa/Lagos is UTC+1 all year
 // Statuses that occupy a chef's calendar day.
-const BLOCKING_STATUSES = ['pending_chef', 'confirmed', 'in_progress', 'awaiting_approval'];
+const BLOCKING_STATUSES = ['pending_chef', 'confirmed', 'in_progress', 'awaiting_approval', 'scheduled'];
 const CHECKIN_WINDOW_HOURS = Number(process.env.HOMIE_CHECKIN_WINDOW_HOURS || 3);
 
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const toKobo = (n) => Math.round(Number(n) * 100);
 
-const httpError = (status, message, code) => Object.assign(new Error(message), { status, code });
+const httpError = (status, message, code, details) => Object.assign(new Error(message), { status, code, details });
 
 // ---------------------------------------------------------------- pricing
 
@@ -51,13 +51,19 @@ const lagosDayRange = (date) => {
 
 const unpaidCutoff = () => new Date(Date.now() - cfg.UNPAID_EXPIRY_MINUTES * 60 * 1000);
 
+// An unpaid booking holds the calendar until its payment window closes: payByAt (series sessions) or a short default.
+const freshUnpaid = () => ({
+  status: 'awaiting_payment',
+  [Op.or]: [{ payByAt: { [Op.gt]: new Date() } }, { payByAt: null, createdAt: { [Op.gte]: unpaidCutoff() } }],
+});
+
 // Bookings that currently hold a chef's calendar (paid/active ones, plus fresh unpaid ones).
 const calendarBookingsWhere = (chefId, range) => ({
   chefId,
   scheduledAt: { [Op.gte]: range[0], [Op.lt]: range[1] },
   [Op.or]: [
     { status: { [Op.in]: BLOCKING_STATUSES } },
-    { status: 'awaiting_payment', createdAt: { [Op.gte]: unpaidCutoff() } },
+    freshUnpaid(),
   ],
 });
 
@@ -84,7 +90,7 @@ const unavailableDays = async (chefId, from, to) => {
       scheduledAt: { [Op.gte]: range[0], [Op.lt]: range[1] },
       [Op.or]: [
         { status: { [Op.in]: BLOCKING_STATUSES } },
-        { status: 'awaiting_payment', createdAt: { [Op.gte]: unpaidCutoff() } },
+        freshUnpaid(),
       ],
     },
     attributes: ['scheduledAt'],
@@ -94,58 +100,7 @@ const unavailableDays = async (chefId, from, to) => {
   return [...days].sort();
 };
 
-// ---------------------------------------------------------- booking create
-
-const createBooking = async (member, input) => {
-  const { chefId, serviceId, address, notes } = input;
-  const scheduledAt = new Date(input.scheduledAt);
-  if (Number.isNaN(scheduledAt.getTime())) throw httpError(400, 'A valid date and time is required');
-  if (scheduledAt.getTime() < Date.now() + cfg.MIN_LEAD_HOURS * HOUR) {
-    throw httpError(400, `Bookings must be made at least ${cfg.MIN_LEAD_HOURS} hours ahead`);
-  }
-
-  const chef = await ChefProfile.findByPk(chefId);
-  if (!chef) throw httpError(404, 'Chef not found');
-  if (chef.memberId === member.id) throw httpError(400, 'You cannot book yourself');
-  if (chef.verificationStatus !== 'verified') throw httpError(400, 'This chef is not verified yet');
-  if (!chef.available) throw httpError(400, 'This chef is not taking bookings right now');
-
-  const service = await ChefService.findOne({ where: { id: serviceId, chefId: chef.id, active: true } });
-  if (!service) throw httpError(404, 'Service not found for this chef');
-
-  let quantity = Math.max(1, parseInt(input.quantity, 10) || 1);
-  if (service.unit === 'hour') quantity = Math.max(3, parseInt(input.quantity, 10) || 3);
-  else if (service.unit === 'dish') quantity = Math.min(quantity, 50);
-  else quantity = 1;
-
-  const guests = Math.max(1, Math.min(parseInt(input.guests, 10) || 1, 500));
-  const groceries = Math.max(0, Math.min(Number(input.groceries) || 0, 5000000));
-  const pricing = computePricing({ unitPrice: service.price, quantity, groceries });
-
-  return db.sequelize.transaction(async (transaction) => {
-    // Serialise bookings for this chef so two hirers cannot take the same day.
-    await ChefProfile.findByPk(chef.id, { transaction, lock: transaction.LOCK.UPDATE });
-    if (await isDateTaken(chef.id, scheduledAt, { transaction })) {
-      throw httpError(409, 'The chef is not available on that date', 'DATE_UNAVAILABLE');
-    }
-    return Booking.create({
-      reference: await generateReference(),
-      hirerId: member.id,
-      chefId: chef.id,
-      serviceId: service.id,
-      serviceTitle: service.title,
-      serviceUnit: service.unit,
-      unitPrice: service.price,
-      quantity,
-      scheduledAt,
-      guests,
-      address: String(address || '').trim(),
-      notes: notes ? String(notes).trim() : null,
-      ...pricing,
-      status: 'awaiting_payment',
-    }, { transaction });
-  });
-};
+// Booking creation (Chef Time, series, quotes, allocation) lives in bookingFlows.service.js.
 
 // ----------------------------------------------------------------- payment
 
@@ -206,8 +161,10 @@ const confirmPayment = async (reference, gatewayData) => {
 
     const booking = await Booking.findByPk(record.bookingId, { transaction, lock: transaction.LOCK.UPDATE });
     if (booking.status === 'awaiting_payment') {
-      await booking.update({ status: 'pending_chef', paidAt }, { transaction });
-      notifyChefOf = booking;
+      // "Match me" bookings wait for an admin to allocate a chef; later sessions of an accepted series are pre-accepted.
+      const next = !booking.chefId ? 'pending_allocation' : booking.preAccepted ? 'confirmed' : 'pending_chef';
+      await booking.update({ status: next, paidAt, ...(next === 'confirmed' ? { acceptedAt: new Date() } : {}) }, { transaction });
+      if (next === 'pending_chef') notifyChefOf = booking;
     } else {
       // Paid after the booking expired or was cancelled: money must go back to the hirer.
       refundAfter = booking;
@@ -289,13 +246,18 @@ const releaseEscrow = async (booking, { kept } = {}) => {
   const payment = await latestPayment(booking.id, ['held']);
   if (!payment) return null;
 
-  const keptAmount = kept === undefined ? Number(booking.total) : round2(kept);
-  const pricing = computePricing({ unitPrice: keptAmount, quantity: 1, groceries: 0, rate: Number(booking.commissionRate) });
+  const total = Number(booking.total);
+  const keptAmount = kept === undefined ? total : round2(kept);
+  const share = total > 0 ? keptAmount / total : 0;
+  const chefPayout = keptAmount === total ? Number(booking.chefPayout) : round2(Number(booking.chefPayout) * share);
   await payment.update({
-    status: 'released', releasedAt: new Date(), payoutStatus: 'pending', payoutAmount: pricing.chefPayout,
+    status: 'released', releasedAt: new Date(), payoutStatus: 'pending', payoutAmount: chefPayout,
   });
-  if (pricing.total !== Number(booking.total)) {
-    await booking.update({ commission: pricing.commission, chefPayout: pricing.chefPayout });
+  if (keptAmount !== total) {
+    // Dispute split: the chef's payout and Homie's gross shrink in proportion; ingredients are a pass-through cost.
+    await booking.update({
+      chefPayout, commission: round2(keptAmount - chefPayout - Number(booking.ingredientsAmount || 0) * share),
+    });
   }
   attemptPayout(payment.id);
   return payment;
@@ -349,18 +311,55 @@ const chefAccept = (bookingId, chef) =>
     if (b.chefId !== chef.id) throw httpError(403, 'Not your booking');
     guard(b, ['pending_chef'], 'This request can no longer be accepted');
     await b.update({ status: 'confirmed', acceptedAt: new Date() }, { transaction: t });
+    if (b.seriesId) {
+      await Booking.update({ preAccepted: true }, {
+        where: { seriesId: b.seriesId, id: { [Op.ne]: b.id }, status: { [Op.in]: ['scheduled', 'awaiting_payment'] } }, transaction: t,
+      });
+    }
   }).then((b) => {
     notify(b.hirerId, { type: 'booking_confirmed', title: 'Chef accepted your booking', body: `${b.serviceTitle} · ${b.reference}`, data: { bookingId: b.id } });
     return b;
   });
 
+// Send an allocated booking (and the rest of its series) back to the allocation queue. The payment stays held.
+const unallocateInTx = async (booking, transaction) => {
+  await booking.update({ chefId: null, status: 'pending_allocation', allocatedAt: null, allocatedByAdminId: null, preAccepted: false }, { transaction });
+  if (booking.seriesId) {
+    await Booking.update({ chefId: null, preAccepted: false }, {
+      where: { seriesId: booking.seriesId, id: { [Op.ne]: booking.id }, status: { [Op.in]: ['scheduled', 'awaiting_payment', 'pending_allocation'] } }, transaction,
+    });
+  }
+};
+
+// Cancel the remaining sessions of a series (refunding any that were already paid).
+const cancelRestOfSeries = async (booking, reason) => {
+  if (!booking.seriesId) return 0;
+  const others = await Booking.findAll({
+    where: { seriesId: booking.seriesId, id: { [Op.ne]: booking.id }, status: { [Op.in]: ['scheduled', 'awaiting_payment', 'pending_chef', 'pending_allocation', 'confirmed'] } },
+  });
+  for (const other of others) {
+    await other.update({ status: 'cancelled', cancelledAt: new Date(), cancelReason: reason });
+    await refundBooking(other, { reason });
+  }
+  return others.length;
+};
+
 const chefDecline = async (bookingId, chef, reason) => {
   const b = await transition(bookingId, async (booking, t) => {
     if (booking.chefId !== chef.id) throw httpError(403, 'Not your booking');
     guard(booking, ['pending_chef'], 'This request can no longer be declined');
-    await booking.update({ status: 'declined', cancelledAt: new Date(), cancelReason: reason || 'Declined by chef' }, { transaction: t });
+    if (booking.matchRequested) {
+      await unallocateInTx(booking, t); // Homie picked this chef, so Homie finds another. No refund.
+    } else {
+      await booking.update({ status: 'declined', cancelledAt: new Date(), cancelReason: reason || 'Declined by chef' }, { transaction: t });
+    }
   });
+  if (b.matchRequested) {
+    notify(b.hirerId, { type: 'booking_reassigned', title: "We're finding you another chef", body: `${b.reference} is back with our team. Your payment is safe.`, data: { bookingId: b.id } });
+    return b;
+  }
   await refundBooking(b, { reason: 'Chef declined' });
+  await cancelRestOfSeries(b, 'Chef declined the series');
   notify(b.hirerId, { type: 'booking_declined', title: 'Booking declined', body: 'Your payment is being refunded in full.', data: { bookingId: b.id } });
   return b;
 };
@@ -369,6 +368,9 @@ const chefCheckIn = (bookingId, chef) =>
   transition(bookingId, async (b, t) => {
     if (b.chefId !== chef.id) throw httpError(403, 'Not your booking');
     guard(b, ['confirmed'], 'Only confirmed bookings can be started');
+    if (b.serviceLine === 'chef_ingredients' && b.procurementStatus !== 'delivered') {
+      throw httpError(409, 'The ingredients have not been delivered yet', 'INGREDIENTS_PENDING');
+    }
     if (Date.now() < new Date(b.scheduledAt).getTime() - CHECKIN_WINDOW_HOURS * HOUR) {
       throw httpError(400, `You can check in up to ${CHECKIN_WINDOW_HOURS} hours before the booking`, 'TOO_EARLY');
     }
@@ -414,21 +416,33 @@ const approveBooking = async (bookingId, { hirerId, system = false } = {}) => {
   return booking;
 };
 
-// Hirer or chef cancels before the service starts. Full refund.
-const cancelBooking = async (bookingId, { member, chef, reason }) => {
+// Hirer or chef cancels before the service starts. Full refund. A chef cancelling a Homie-allocated booking
+// returns it to the allocation queue instead (the hirer keeps their booking and payment).
+const cancelBooking = async (bookingId, { member, chef, reason, wholeSeries = false }) => {
+  let unallocated = false;
   const booking = await transition(bookingId, async (b, t) => {
     const isHirer = b.hirerId === member.id;
     const isChef = chef && b.chefId === chef.id;
     if (!isHirer && !isChef) throw httpError(403, 'Not your booking');
-    guard(b, isHirer ? ['awaiting_payment', 'pending_chef', 'confirmed'] : ['confirmed'],
+    guard(b, isHirer ? ['awaiting_payment', 'pending_chef', 'confirmed', 'scheduled', 'pending_allocation'] : ['confirmed'],
       'This booking can no longer be cancelled');
+    if (!isHirer && b.matchRequested) {
+      await unallocateInTx(b, t);
+      unallocated = true;
+      return;
+    }
     await b.update({
       status: 'cancelled', cancelledAt: new Date(),
       cancelReason: reason || (isHirer ? 'Cancelled by hirer' : 'Cancelled by chef'),
     }, { transaction: t });
   });
+  if (unallocated) {
+    notify(booking.hirerId, { type: 'booking_reassigned', title: "We're finding you another chef", body: `${booking.reference} is back with our team.`, data: { bookingId: booking.id } });
+    return booking;
+  }
   await refundBooking(booking, { reason: booking.cancelReason });
-  const chefProfile = await ChefProfile.findByPk(booking.chefId);
+  if (wholeSeries && booking.hirerId === member.id) await cancelRestOfSeries(booking, booking.cancelReason);
+  const chefProfile = booking.chefId ? await ChefProfile.findByPk(booking.chefId) : null;
   const other = booking.hirerId === member.id ? chefProfile?.memberId : booking.hirerId;
   if (other) {
     notify(other, { type: 'booking_cancelled', title: 'Booking cancelled', body: booking.reference, data: { bookingId: booking.id } });
@@ -545,14 +559,19 @@ const resolveDispute = async (disputeId, { resolution, splitPercentToChef, note 
 
 const runScheduledJobs = async () => {
   const now = new Date();
-  const summary = { autoReleased: 0, expired: 0, chefTimeouts: 0, payoutsRetried: 0 };
+  const summary = { autoReleased: 0, expired: 0, chefTimeouts: 0, allocationExpired: 0, payoutsRetried: 0 };
   try {
     const due = await Booking.findAll({ where: { status: 'awaiting_approval', autoReleaseAt: { [Op.lte]: now } } });
     for (const booking of due) {
       try { await approveBooking(booking.id, { system: true }); summary.autoReleased += 1; } catch (e) { console.error('auto-release failed', booking.reference, e.message); }
     }
 
-    const stale = await Booking.findAll({ where: { status: 'awaiting_payment', createdAt: { [Op.lt]: unpaidCutoff() } } });
+    const stale = await Booking.findAll({
+      where: {
+        status: 'awaiting_payment',
+        [Op.or]: [{ payByAt: { [Op.lt]: now } }, { payByAt: null, createdAt: { [Op.lt]: unpaidCutoff() } }],
+      },
+    });
     for (const booking of stale) {
       await booking.update({ status: 'expired' });
       summary.expired += 1;
@@ -562,6 +581,12 @@ const runScheduledJobs = async () => {
     const silent = await Booking.findAll({ where: { status: 'pending_chef', paidAt: { [Op.lt]: cutoff } } });
     for (const booking of silent) {
       try {
+        if (booking.matchRequested) {
+          // Homie allocated this chef and they did not answer: back to the queue, payment stays held.
+          await transition(booking.id, async (b, t) => { if (b.status === 'pending_chef') await unallocateInTx(b, t); });
+          summary.chefTimeouts += 1;
+          continue;
+        }
         await transition(booking.id, async (b, t) => {
           guard(b, ['pending_chef']);
           await b.update({ status: 'cancelled', cancelledAt: now, cancelReason: 'Chef did not respond in time' }, { transaction: t });
@@ -570,6 +595,18 @@ const runScheduledJobs = async () => {
         notify(booking.hirerId, { type: 'booking_cancelled', title: 'Booking cancelled', body: 'The chef did not respond in time. You have been refunded.', data: { bookingId: booking.id } });
         summary.chefTimeouts += 1;
       } catch (e) { console.error('chef timeout failed', booking.reference, e.message); }
+    }
+
+    const allocationCutoff = new Date(now.getTime() - cfg.ALLOCATION_DEADLINE_HOURS * HOUR);
+    const unmatched = await Booking.findAll({ where: { status: 'pending_allocation', paidAt: { [Op.lt]: allocationCutoff } } });
+    for (const booking of unmatched) {
+      try {
+        await booking.update({ status: 'cancelled', cancelledAt: now, cancelReason: 'We could not find an available chef in time' });
+        await refundBooking(booking, { reason: 'No chef available' });
+        await cancelRestOfSeries(booking, 'We could not find an available chef in time');
+        notify(booking.hirerId, { type: 'booking_cancelled', title: 'Booking cancelled', body: 'We could not find an available chef in time. You have been refunded.', data: { bookingId: booking.id } });
+        summary.allocationExpired += 1;
+      } catch (e) { console.error('allocation expiry failed', booking.reference, e.message); }
     }
 
     const waiting = await BookingPayment.findAll({ where: { status: 'released', payoutStatus: 'pending' }, limit: 50 });
@@ -589,7 +626,11 @@ module.exports = {
   isDateTaken,
   unavailableDays,
   lagosDayKey,
-  createBooking,
+  generateReference,
+  unallocateInTx,
+  cancelRestOfSeries,
+  transition,
+  round2,
   initializePayment,
   confirmPayment,
   verifyPayment,
